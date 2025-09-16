@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+
+# SQLite DB (실행 중 생성됨, 공유 불필요)
+*.db
+*.sqlite3
+
+# Docker 관련
+/data/
+docker-compose.override.yml
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# 환경변수 파일
+.env

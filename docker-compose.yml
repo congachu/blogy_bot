@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  discord-bot:
+    build: .
+    container_name: my-discord-bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DB_PATH=/data/bot.db
+      - TZ=Asia/Seoul
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
