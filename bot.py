@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS guild_settings(
 
 CREATE TABLE IF NOT EXISTS personal_channels(
     channel_id BIGINT PRIMARY KEY,
-    owner_id BIGINT NOT NULL
+    owner_id BIGINT NOT NULL UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS blog(
@@ -116,6 +116,20 @@ async def get_dashboard_message_id(channel_id:int) -> Optional[int]:
         row = await con.fetchrow("SELECT message_id FROM dashboards WHERE channel_id=$1", channel_id)
     return int(row["message_id"]) if row and row["message_id"] is not None else None
 
+async def get_channel_by_owner(owner_id:int) -> Optional[int]:
+    async with PG_POOL.acquire() as con:
+        row = await con.fetchrow(
+            "SELECT channel_id FROM personal_channels WHERE owner_id=$1", owner_id
+        )
+    return int(row["channel_id"]) if row else None
+
+async def purge_channel_records(channel_id:int):
+    async with PG_POOL.acquire() as con:
+        async with con.transaction():
+            await con.execute("DELETE FROM dashboards WHERE channel_id=$1", channel_id)
+            await con.execute("DELETE FROM blog WHERE channel_id=$1", channel_id)
+            await con.execute("DELETE FROM personal_channels WHERE channel_id=$1", channel_id)
+
 # ========= 유틸 =========
 def slugify_channel_name(name:str) -> str:
     s = name.strip().lower()
@@ -183,6 +197,16 @@ async def on_message(message:discord.Message):
 
     # 3~5) 개인채널 생성 채널
     if create_ch and message.channel.id == create_ch:
+        existing = await get_channel_by_owner(message.author.id)
+        if existing:
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction("❌")
+            ch = message.guild.get_channel(existing)
+            if ch:
+                await message.reply(f"{message.author.mention} 이미 개인 채널이 있어요: {ch.mention}", mention_author=False)
+            else:
+                await message.reply(f"{message.author.mention} 이미 개인 채널이 등록되어 있어요. 먼저 `/채널삭제`로 정리해 주세요.", mention_author=False)
+            return
         name = slugify_channel_name(message.content or f"{message.author.name}-channel")
         guild = message.guild
         overwrites = {
@@ -276,6 +300,29 @@ async def blog_remove(interaction:discord.Interaction):
         await set_dashboard_message_id(interaction.channel.id, None)
 
     await interaction.response.send_message("블로그가 삭제되었습니다.", ephemeral=True)
+
+@BOT.tree.command(name="채널삭제", description="현재 개인 채널을 삭제합니다.", guild_only=True)
+async def delete_personal_channel(interaction: discord.Interaction):
+    # 텍스트 채널만
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
+
+    # 개인채널 여부/소유자 확인
+    owner_id = await get_owner(interaction.channel.id)
+    if not owner_id:
+        return await interaction.response.send_message("여기는 개인 채널이 아닙니다.", ephemeral=True)
+    if owner_id != interaction.user.id:
+        return await interaction.response.send_message("본인 개인 채널에서만 사용할 수 있어요.", ephemeral=True)
+
+    # 삭제 안내 후 삭제
+    await interaction.response.send_message("이 채널을 삭제합니다. 3초 후 삭제돼요.", ephemeral=True)
+    await asyncio.sleep(3)
+
+    # DB 정리 → 채널 삭제
+    await purge_channel_records(interaction.channel.id)
+    with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+        await interaction.channel.delete(reason=f"/채널삭제 by {interaction.user}")
+
 
 # ========= 실행 =========
 if __name__ == "__main__":

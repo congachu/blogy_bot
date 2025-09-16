@@ -3,18 +3,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certifi
 ENV PYTHONUNBUFFERED=1 TZ=Asia/Seoul
 WORKDIR /app
 
-# 👉 requirements 복사 + 설치 (설치 확인까지 강제)
+# 실제 requirements.txt를 복사
 COPY requirements.txt .
+# 설치 + 설치 확인
 RUN pip install --no-cache-dir -r requirements.txt && python - <<'PY'
 import importlib, sys
 for m in ("asyncpg","discord","dotenv"):
     try:
         importlib.import_module(m)
-        print(f"OK {m}")
+        print("OK", m)
     except Exception as e:
-        print(f"FAIL {m} -> {e}", file=sys.stderr); sys.exit(1)
+        print("FAIL", m, "->", e, file=sys.stderr); sys.exit(1)
 PY
 
+# 앱 코드
 COPY bot.py .
 
 ENTRYPOINT ["/usr/bin/tini","--"]
