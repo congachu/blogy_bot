@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: discord-bot
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    region: singapore
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false      # Render 대시보드에서 수동 입력 (깃에 토큰 넣지 않기)
+      - key: DATABASE_URL
+        sync: false      # 외부 Postgres (Supabase/Neon 등) 주소 입력
+      - key: TZ
+        value: Asia/Seoul
