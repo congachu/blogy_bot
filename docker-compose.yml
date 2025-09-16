@@ -1,12 +1,33 @@
 version: "3.8"
 services:
-  discord-bot:
+  db:
+    image: postgres:16
+    container_name: pg-discord
+    environment:
+      - POSTGRES_USER=botuser
+      - POSTGRES_PASSWORD=botpass
+      - POSTGRES_DB=botdb
+      - TZ=Asia/Seoul
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U botuser -d botdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  bot:
     build: .
     container_name: my-discord-bot
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - DB_PATH=/data/bot.db
+      - DATABASE_URL=postgres://botuser:botpass@db:5432/botdb
       - TZ=Asia/Seoul
-    volumes:
-      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  pgdata:
