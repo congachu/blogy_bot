@@ -260,7 +260,8 @@ async def set_create_channel(interaction:discord.Interaction, channel:discord.Te
 BOT.tree.add_command(admin)
 
 # 개인채널 소유자용 커맨드
-@BOT.tree.command(name="블로그등록", description="현재 개인 채널에 블로그 URL을 등록합니다.", guild_only=True)
+@BOT.tree.command(name="블로그등록", description="현재 개인 채널에 블로그 URL을 등록합니다.")
+@app_commands.guild_only()
 @app_commands.describe(url="블로그 주소 (https://...)")
 async def blog_register(interaction:discord.Interaction, url:str):
     if not isinstance(interaction.channel, discord.TextChannel):
@@ -279,7 +280,8 @@ async def blog_register(interaction:discord.Interaction, url:str):
     await interaction.response.send_message("블로그가 등록되었습니다. 대시보드를 갱신할게요.", ephemeral=True)
     await ensure_dashboard_at_bottom(interaction.channel)
 
-@BOT.tree.command(name="블로그삭제", description="현재 개인 채널의 블로그 등록을 해제합니다.", guild_only=True)
+@BOT.tree.command(name="블로그삭제", description="현재 개인 채널의 블로그 등록을 해제합니다.")
+@app_commands.guild_only()
 async def blog_remove(interaction:discord.Interaction):
     if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
@@ -301,7 +303,8 @@ async def blog_remove(interaction:discord.Interaction):
 
     await interaction.response.send_message("블로그가 삭제되었습니다.", ephemeral=True)
 
-@BOT.tree.command(name="채널삭제", description="현재 개인 채널을 삭제합니다.", guild_only=True)
+@BOT.tree.command(name="채널삭제", description="현재 개인 채널을 삭제합니다.")
+@app_commands.guild_only()
 async def delete_personal_channel(interaction: discord.Interaction):
     # 텍스트 채널만
     if not isinstance(interaction.channel, discord.TextChannel):
