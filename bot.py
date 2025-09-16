@@ -145,8 +145,12 @@ async def purge_channel_records(channel_id:int):
 # ========= 유틸 =========
 def slugify_channel_name(name:str) -> str:
     s = name.strip().lower()
+    # 공백류 -> 하이픈
     s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"[^a-z0-9\-\_]", "", s)
+    # 허용: 영어, 숫자, 하이픈, 밑줄, 한글
+    s = re.sub(r"[^a-z0-9ㄱ-ㅎ가-힣\-_]", "", s)
+    # 연속된 하이픈 정리
+    s = re.sub(r"-{2,}", "-", s)
     return s[:90] if s else "personal"
 
 def sanitize_nick(nick:str) -> str:
