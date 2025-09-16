@@ -271,7 +271,8 @@ async def on_message(message:discord.Message):
             message.author: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
         }
-        new_channel = await guild.create_text_channel(name=name, overwrites=overwrites, reason=f"개인채널 생성 by {message.author}")
+        parent_category = message.channel.category
+        new_channel = await guild.create_text_channel(name=name, overwrites=overwrites, reason=f"개인채널 생성 by {message.author}", category=parent_category)
         await set_personal_channel(new_channel.id, message.author.id)
         await new_channel.send(
             f"{message.author.mention} 님의 개인 채널이 생성되었습니다.\n"
@@ -389,6 +390,19 @@ async def delete_personal_channel(interaction: discord.Interaction):
     await purge_channel_records(interaction.channel.id)
     with contextlib.suppress(discord.Forbidden, discord.HTTPException):
         await interaction.channel.delete(reason=f"/채널삭제 by {interaction.user}")
+
+@BOT.tree.command(name="채널삭제강제", description="특정 유저의 개인 채널 기록을 DB에서 제거합니다. (관리자 전용)")
+@app_commands.guild_only()
+@app_commands.describe(user="개인 채널을 가진 유저")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def force_delete_channel(interaction: discord.Interaction, user: discord.User):
+    ch_id = await get_channel_by_owner(user.id)
+    if not ch_id:
+        return await interaction.response.send_message(f"{user.mention} 님의 개인 채널 기록이 없습니다.", ephemeral=True)
+
+    await purge_channel_records(ch_id)
+    await interaction.response.send_message(f"{user.mention} 님의 개인 채널 기록을 DB에서 제거했습니다.", ephemeral=True)
+
 
 # ========= 실행 =========
 async def main():
