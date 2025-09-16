@@ -24,9 +24,9 @@ INTENTS.message_content = True
 INTENTS.members = True
 BOT = commands.Bot(command_prefix=COMMAND_PREFIX, intents=INTENTS)
 
-# ========= SSL 컨텍스트 (기본: 검증 끔 / 필요시 DB_SSL_INSECURE=0로 엄격 모드) =========
+# ========= SSL 컨텍스트 =========
 def make_ssl_ctx() -> ssl.SSLContext:
-    insecure = os.getenv("DB_SSL_INSECURE", "1") == "1"  # 기본 1(개인/테스트), 운영은 0 권장
+    insecure = os.getenv("DB_SSL_INSECURE", "1") == "1"  # 기본 1(테스트). 운영은 0 권장
     ctx = ssl.create_default_context()
     if insecure:
         ctx.check_hostname = False
@@ -37,8 +37,7 @@ def make_ssl_ctx() -> ssl.SSLContext:
     return ctx
 
 SSL_CTX = make_ssl_ctx()
-
-PG_POOL: Optional[asyncpg.Pool] = None  # 전역 풀
+PG_POOL: Optional[asyncpg.Pool] = None
 
 # ========= DB 유틸 =========
 SCHEMA_SQL = """
@@ -48,7 +47,6 @@ CREATE TABLE IF NOT EXISTS guild_settings(
     create_channel_id BIGINT
 );
 
--- 최초 설치 기준 스키마(길드 기준 유일 제약 포함)
 CREATE TABLE IF NOT EXISTS personal_channels(
     channel_id BIGINT PRIMARY KEY,
     owner_id  BIGINT NOT NULL,
@@ -72,11 +70,9 @@ async def init_db():
     async with PG_POOL.acquire() as con:
         async with con.transaction():
             await con.execute(SCHEMA_SQL)
-            # ---- 마이그레이션: 기존 personal_channels에 guild_id 추가 / 유니크 제약 교체 ----
+            # personal_channels 마이그레이션
             await con.execute("ALTER TABLE personal_channels ADD COLUMN IF NOT EXISTS guild_id BIGINT;")
-            # 과거 owner_id UNIQUE 제약 삭제 (자동 생성 이름 가정)
             await con.execute("ALTER TABLE personal_channels DROP CONSTRAINT IF EXISTS personal_channels_owner_id_key;")
-            # 길드+유저 복합 유니크 인덱스
             await con.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS personal_channels_guild_owner_idx
                 ON personal_channels(guild_id, owner_id);
@@ -156,7 +152,7 @@ async def get_channel_by_owner(guild_id:int, owner_id:int) -> Optional[int]:
         if row:
             return int(row["channel_id"])
 
-        # 레거시: guild_id가 NULL인 행이 있으면 실제 채널로 길드 매핑해서 즉시 보정
+        # 레거시 보정
         legacy = await con.fetchrow(
             "SELECT channel_id FROM personal_channels WHERE owner_id=$1 AND guild_id IS NULL",
             owner_id
@@ -172,7 +168,6 @@ async def get_channel_by_owner(guild_id:int, owner_id:int) -> Optional[int]:
                 if ch.guild.id == guild_id:
                     return ch_id
             else:
-                # 고아 데이터 정리
                 await purge_channel_records(ch_id)
     return None
 
@@ -182,28 +177,6 @@ async def purge_channel_records(channel_id:int):
             await con.execute("DELETE FROM dashboards WHERE channel_id=$1", channel_id)
             await con.execute("DELETE FROM blog WHERE channel_id=$1", channel_id)
             await con.execute("DELETE FROM personal_channels WHERE channel_id=$1", channel_id)
-
-# 백필(선택): 부팅 시 한 번 전체 NULL guild_id를 보정
-async def backfill_guild_ids():
-    async with PG_POOL.acquire() as con:
-        rows = await con.fetch("SELECT channel_id FROM personal_channels WHERE guild_id IS NULL")
-    if not rows:
-        return
-    fixed = removed = 0
-    for r in rows:
-        ch_id = int(r["channel_id"])
-        ch = BOT.get_channel(ch_id)
-        if ch and getattr(ch, "guild", None):
-            async with PG_POOL.acquire() as con:
-                await con.execute(
-                    "UPDATE personal_channels SET guild_id=$1 WHERE channel_id=$2",
-                    ch.guild.id, ch_id
-                )
-            fixed += 1
-        else:
-            await purge_channel_records(ch_id)
-            removed += 1
-    print(f"Backfill guild_id: updated={fixed}, removed_orphans={removed}")
 
 # ========= 유틸 =========
 def slugify_channel_name(name:str) -> str:
@@ -234,6 +207,47 @@ async def ensure_dashboard_at_bottom(channel:discord.TextChannel):
     embed.set_footer(text="이 채널의 대시보드")
     new_msg = await channel.send(embed=embed)
     await set_dashboard_message_id(channel.id, new_msg.id)
+
+# ========= 서버 전체 블로그 대시보드 =========
+SERVER_DASHBOARDS: dict[int, tuple[int, Optional[int]]] = {}  # guild_id -> (channel_id, msg_id)
+
+async def refresh_server_dashboard(guild: discord.Guild):
+    """지정된 채널에 서버 전체 블로그 목록을 임베드로 다시 올림."""
+    if guild.id not in SERVER_DASHBOARDS:
+        return
+    channel_id, old_msg_id = SERVER_DASHBOARDS[guild.id]
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+
+    # DB에서 서버 내 모든 블로그 수집
+    async with PG_POOL.acquire() as con:
+        rows = await con.fetch(
+            """
+            SELECT b.url, p.owner_id
+            FROM blog b
+            JOIN personal_channels p ON p.channel_id = b.channel_id
+            WHERE p.guild_id = $1
+            ORDER BY p.owner_id
+            """,
+            guild.id,
+        )
+
+    if not rows:
+        desc = "등록된 블로그가 없습니다."
+    else:
+        desc = "\n".join(f"🔗 [열기]({r['url']}) - <@{r['owner_id']}>" for r in rows)
+
+    embed = discord.Embed(title="📑 서버 블로그 목록", description=desc, color=0x00BFFF)
+
+    # 이전 메시지 삭제 후 다시 게시 (항상 맨 아래로)
+    if old_msg_id:
+        with contextlib.suppress(discord.NotFound, discord.Forbidden, discord.HTTPException):
+            msg = await channel.fetch_message(old_msg_id)
+            await msg.delete()
+
+    msg = await channel.send(embed=embed)
+    SERVER_DASHBOARDS[guild.id] = (channel.id, msg.id)
 
 # ========= 헬스 서버 & DB 재시도 =========
 async def run_health_server():
@@ -278,7 +292,7 @@ async def connect_db_with_retry(max_attempts=8):
 async def on_ready():
     print(f"Logged in as {BOT.user} (ID: {BOT.user.id})")
 
-    # 1) 슬래시 명령어를 먼저 동기화 (길드 지정 시 즉시 반영)
+    # 슬래시 명령어 동기화
     try:
         if TEST_GUILD_ID:
             guild = discord.Object(id=TEST_GUILD_ID)
@@ -291,12 +305,8 @@ async def on_ready():
     except Exception as e:
         print("Sync error:", e)
 
-    # 2) DB 연결(실패해도 봇은 계속 동작)
+    # DB 연결
     await connect_db_with_retry()
-
-    # 3) 레거시 백필(선택)
-    if PG_POOL:
-        await backfill_guild_ids()
 
 @BOT.event
 async def on_message(message:discord.Message):
@@ -309,7 +319,7 @@ async def on_message(message:discord.Message):
 
     nick_ch, create_ch = await get_settings(message.guild.id)
 
-    # 2) 닉변 채널
+    # 닉변 채널
     if nick_ch and message.channel.id == nick_ch:
         new_nick = sanitize_nick(message.content)
         with contextlib.suppress(discord.Forbidden, discord.HTTPException):
@@ -320,7 +330,7 @@ async def on_message(message:discord.Message):
             await message.delete()
         return
 
-    # 3~5) 개인채널 생성 채널 (같은 카테고리에 생성)
+    # 개인채널 생성 채널 (같은 카테고리에 생성)
     if create_ch and message.channel.id == create_ch:
         existing = await get_channel_by_owner(message.guild.id, message.author.id)
         if existing:
@@ -358,7 +368,7 @@ async def on_message(message:discord.Message):
             await message.add_reaction("✅")
         return
 
-    # 7) 개인채널이면 대시보드 최신 유지
+    # 개인채널이면 대시보드 최신 유지
     owner_id = await get_owner(message.channel.id)
     if owner_id:
         await ensure_dashboard_at_bottom(message.channel)
@@ -367,19 +377,13 @@ async def on_message(message:discord.Message):
 class GuildAdmin(app_commands.Group):
     pass
 
-admin = GuildAdmin(
-    name="설정",
-    description="관리자 전용 설정"
-)
+admin = GuildAdmin(name="설정", description="관리자 전용 설정")
 
 @admin.command(name="닉변채널지정", description="닉네임 변경 채널을 지정합니다. (관리자 전용)")
 @app_commands.guild_only()
 @app_commands.describe(channel="닉변 채널로 사용할 텍스트 채널")
 @app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
 async def set_nick_channel(interaction:discord.Interaction, channel:discord.TextChannel):
-    if PG_POOL is None:
-        return await interaction.response.send_message("지금 DB에 연결할 수 없어 설정을 저장하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     await set_setting(interaction.guild.id, "nick_channel_id", channel.id)
     await interaction.response.send_message(f"닉변 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
@@ -387,52 +391,33 @@ async def set_nick_channel(interaction:discord.Interaction, channel:discord.Text
 @app_commands.guild_only()
 @app_commands.describe(channel="개인채널 생성용 텍스트 채널")
 @app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
 async def set_create_channel(interaction:discord.Interaction, channel:discord.TextChannel):
-    if PG_POOL is None:
-        return await interaction.response.send_message("지금 DB에 연결할 수 없어 설정을 저장하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     await set_setting(interaction.guild.id, "create_channel_id", channel.id)
     await interaction.response.send_message(f"개인채널 생성 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
 BOT.tree.add_command(admin)
 
-# 개인채널 소유자용 커맨드
+# ========= 개인채널 소유자용 명령어 =========
 @BOT.tree.command(name="블로그등록", description="현재 개인 채널에 블로그 URL을 등록합니다.")
 @app_commands.guild_only()
 @app_commands.describe(url="블로그 주소 (https://...)")
 async def blog_register(interaction:discord.Interaction, url:str):
-    if PG_POOL is None:
-        return await interaction.response.send_message("지금 DB에 연결할 수 없어 저장하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
-    if not isinstance(interaction.channel, discord.TextChannel):
-        return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
-
     owner_id = await get_owner(interaction.channel.id)
-    if not owner_id:
-        return await interaction.response.send_message("여기는 개인 채널이 아닙니다.", ephemeral=True)
-    if owner_id != interaction.user.id and not is_admin_or_mod(interaction.user):
-        return await interaction.response.send_message("이 개인 채널의 소유자만 등록할 수 있어요.", ephemeral=True)
-
+    if not owner_id or owner_id != interaction.user.id:
+        return await interaction.response.send_message("본인 개인 채널에서만 등록할 수 있어요.", ephemeral=True)
     if not re.match(r"^https?://", url):
         return await interaction.response.send_message("URL은 http(s)로 시작해야 해요.", ephemeral=True)
-
     await set_blog(interaction.channel.id, url)
-    await interaction.response.send_message("블로그가 등록되었습니다. 대시보드를 갱신할게요.", ephemeral=True)
     await ensure_dashboard_at_bottom(interaction.channel)
+    await refresh_server_dashboard(interaction.guild)
+    await interaction.response.send_message("블로그가 등록되었습니다.", ephemeral=True)
 
 @BOT.tree.command(name="블로그삭제", description="현재 개인 채널의 블로그 등록을 해제합니다.")
 @app_commands.guild_only()
 async def blog_remove(interaction:discord.Interaction):
-    if PG_POOL is None:
-        return await interaction.response.send_message("지금 DB에 연결할 수 없어 처리하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
-    if not isinstance(interaction.channel, discord.TextChannel):
-        return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
-
     owner_id = await get_owner(interaction.channel.id)
-    if not owner_id:
-        return await interaction.response.send_message("여기는 개인 채널이 아닙니다.", ephemeral=True)
-    if owner_id != interaction.user.id and not is_admin_or_mod(interaction.user):
-        return await interaction.response.send_message("이 개인 채널의 소유자만 삭제할 수 있어요.", ephemeral=True)
-
+    if not owner_id or owner_id != interaction.user.id:
+        return await interaction.response.send_message("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
     await set_blog(interaction.channel.id, None)
 
     old_id = await get_dashboard_message_id(interaction.channel.id)
@@ -442,40 +427,36 @@ async def blog_remove(interaction:discord.Interaction):
             await msg.delete()
         await set_dashboard_message_id(interaction.channel.id, None)
 
+    await refresh_server_dashboard(interaction.guild)
     await interaction.response.send_message("블로그가 삭제되었습니다.", ephemeral=True)
+
+@BOT.tree.command(name="블로그목록", description="서버 전체 블로그 목록을 특정 채널에 게시합니다. (관리자 전용)")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def blog_list(interaction:discord.Interaction, channel:discord.TextChannel):
+    SERVER_DASHBOARDS[interaction.guild.id] = (channel.id, None)
+    await refresh_server_dashboard(interaction.guild)
+    await interaction.response.send_message(f"{channel.mention} 에 서버 전체 블로그 목록을 게시했습니다.", ephemeral=True)
 
 @BOT.tree.command(name="채널삭제", description="현재 개인 채널을 삭제합니다.")
 @app_commands.guild_only()
 async def delete_personal_channel(interaction: discord.Interaction):
-    if PG_POOL is None:
-        return await interaction.response.send_message("지금 DB에 연결할 수 없어 처리하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
-    if not isinstance(interaction.channel, discord.TextChannel):
-        return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
-
     owner_id = await get_owner(interaction.channel.id)
-    if not owner_id:
-        return await interaction.response.send_message("여기는 개인 채널이 아닙니다.", ephemeral=True)
-    if owner_id != interaction.user.id:
+    if not owner_id or owner_id != interaction.user.id:
         return await interaction.response.send_message("본인 개인 채널에서만 사용할 수 있어요.", ephemeral=True)
-
     await interaction.response.send_message("이 채널을 삭제합니다. 3초 후 삭제돼요.", ephemeral=True)
     await asyncio.sleep(3)
     await purge_channel_records(interaction.channel.id)
     with contextlib.suppress(discord.Forbidden, discord.HTTPException):
         await interaction.channel.delete(reason=f"/채널삭제 by {interaction.user}")
 
-# 1) /채널삭제 @유저 : 관리자 전용, 해당 유저 개인채널 DB 기록만 정리(오류 방지용)
 @BOT.tree.command(name="채널삭제강제", description="특정 유저의 개인 채널 기록을 DB에서 제거합니다. (관리자 전용)")
 @app_commands.guild_only()
-@app_commands.describe(user="개인 채널을 가진 유저")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def force_delete_channel(interaction: discord.Interaction, user: discord.User):
-    if PG_POOL is None:
-        return await interaction.response.send_message("DB 연결이 안 됩니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
     ch_id = await get_channel_by_owner(interaction.guild.id, user.id)
     if not ch_id:
         return await interaction.response.send_message(f"{user.mention} 님의 개인 채널 기록이 없습니다.", ephemeral=True)
-
     await purge_channel_records(ch_id)
     await interaction.response.send_message(f"{user.mention} 님의 개인 채널 기록을 DB에서 제거했습니다.", ephemeral=True)
 
@@ -483,7 +464,6 @@ async def force_delete_channel(interaction: discord.Interaction, user: discord.U
 async def main():
     if not TOKEN:
         raise SystemExit("환경변수 DISCORD_TOKEN을 설정하세요.")
-    # 헬스 서버(포트 바인딩)와 봇을 동시에 실행 (Web 서비스일 때만 의미 있음)
     await asyncio.gather(
         run_health_server(),
         BOT.start(TOKEN),
