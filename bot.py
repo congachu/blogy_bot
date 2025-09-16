@@ -196,22 +196,35 @@ def sanitize_nick(nick:str) -> str:
 def is_admin_or_mod(member:discord.Member) -> bool:
     return member.guild_permissions.manage_guild or member.guild_permissions.administrator
 
-async def ensure_dashboard_at_bottom(channel:discord.TextChannel):
-    urls = await list_blogs(channel.id)
-    if not urls:
-        return
-    lines = [f"🔗 [블로그 열기]({u})" for u in urls]
-    embed = discord.Embed(title="📌 블로그 대시보드", description="\n".join(lines), color=0xFF7710)
-    embed.set_footer(text="이 채널의 대시보드")
+# 안전한 개인채널 대시보드 갱신
+async def refresh_dashboard_safe(channel: discord.TextChannel):
+    try:
+        urls = await list_blogs(channel.id)
+        old_id = await get_dashboard_message_id(channel.id)
 
-    old_id = await get_dashboard_message_id(channel.id)
-    if old_id:
-        with contextlib.suppress(discord.NotFound, discord.Forbidden, discord.HTTPException):
-            msg = await channel.fetch_message(old_id)
-            await msg.delete()
+        # 블로그 없으면 기존 대시보드 제거 + message_id NULL 세팅
+        if not urls:
+            if old_id:
+                with contextlib.suppress(discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    msg = await channel.fetch_message(old_id)
+                    await msg.delete()
+                await set_dashboard_message_id(channel.id, None)
+            return
 
-    new_msg = await channel.send(embed=embed)
-    await set_dashboard_message_id(channel.id, new_msg.id)
+        lines = [f"🔗 [블로그 열기]({u})" for u in urls]
+        embed = discord.Embed(title="📌 블로그 대시보드", description="\n".join(lines), color=0xFF7710)
+        embed.set_footer(text="이 채널의 대시보드")
+
+        if old_id:
+            with contextlib.suppress(discord.NotFound, discord.Forbidden, discord.HTTPException):
+                msg = await channel.fetch_message(old_id)
+                await msg.delete()
+
+        new_msg = await channel.send(embed=embed)
+        await set_dashboard_message_id(channel.id, new_msg.id)
+    except Exception:
+        # 대시보드 실패가 명령 자체를 망치지 않도록 무시
+        pass
 
 # ========= 서버 전체 블로그 대시보드 =========
 SERVER_DASHBOARDS = {}  # guild_id -> (channel_id, msg_id)
@@ -224,13 +237,17 @@ async def refresh_server_dashboard(guild:discord.Guild):
     if not channel:
         return
 
-    async with PG_POOL.acquire() as con:
-        rows = await con.fetch("""
-            SELECT b.url, p.owner_id
-            FROM blog b
-            JOIN personal_channels p ON b.channel_id = p.channel_id
-            WHERE p.guild_id=$1
-        """, guild.id)
+    rows = []
+    try:
+        async with PG_POOL.acquire() as con:
+            rows = await con.fetch("""
+                SELECT b.url, p.owner_id
+                FROM blog b
+                JOIN personal_channels p ON b.channel_id = p.channel_id
+                WHERE p.guild_id=$1
+            """, guild.id)
+    except Exception:
+        pass
 
     if not rows:
         desc = "등록된 블로그가 없습니다."
@@ -361,7 +378,7 @@ async def on_message(message:discord.Message):
     # 개인채널이면 대시보드 최신 유지
     owner_id = await get_owner(message.channel.id)
     if owner_id:
-        await ensure_dashboard_at_bottom(message.channel)
+        await refresh_dashboard_safe(message.channel)
 
 # ========= 명령어 =========
 class GuildAdmin(app_commands.Group): pass
@@ -372,65 +389,75 @@ admin = GuildAdmin(name="설정", description="관리자 전용 설정")
 @app_commands.describe(channel="닉변 채널")
 @app_commands.default_permissions(manage_guild=True)
 async def set_nick_channel(interaction, channel:discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     await set_setting(interaction.guild.id, "nick_channel_id", channel.id)
-    await interaction.response.send_message(f"닉변 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
+    await interaction.followup.send(f"닉변 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
 @admin.command(name="개인채널생성채널지정", description="개인채널 생성 채널을 지정합니다. (관리자 전용)")
 @app_commands.guild_only()
 @app_commands.describe(channel="개인채널 생성 채널")
 @app_commands.default_permissions(manage_guild=True)
 async def set_create_channel(interaction, channel:discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
     await set_setting(interaction.guild.id, "create_channel_id", channel.id)
-    await interaction.response.send_message(f"개인채널 생성 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
+    await interaction.followup.send(f"개인채널 생성 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
 BOT.tree.add_command(admin)
 
 # 개인채널 소유자용 블로그 명령어
 @BOT.tree.command(name="블로그등록", description="현재 개인 채널에 블로그를 추가합니다.")
 @app_commands.guild_only()
-async def blog_register(interaction, url:str):
+@app_commands.describe(url="http(s)로 시작하는 블로그 주소")
+async def blog_register(interaction: discord.Interaction, url: str):
+    await interaction.response.defer(ephemeral=True)
     owner_id = await get_owner(interaction.channel.id)
     if not owner_id or owner_id != interaction.user.id:
-        return await interaction.response.send_message("본인 개인 채널에서만 등록할 수 있어요.", ephemeral=True)
+        return await interaction.followup.send("본인 개인 채널에서만 등록할 수 있어요.", ephemeral=True)
     if not re.match(r"^https?://", url):
-        return await interaction.response.send_message("URL은 http(s):// 로 시작해야 해요.", ephemeral=True)
+        return await interaction.followup.send("URL은 http(s):// 로 시작해야 해요.", ephemeral=True)
 
     await add_blog(interaction.channel.id, url)
-    await ensure_dashboard_at_bottom(interaction.channel)
+    await refresh_dashboard_safe(interaction.channel)
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message("블로그가 등록되었습니다.", ephemeral=True)
+    await interaction.followup.send("블로그가 등록되었습니다.", ephemeral=True)
 
 @BOT.tree.command(name="블로그삭제", description="현재 개인 채널에서 특정 블로그를 삭제합니다.")
 @app_commands.guild_only()
-async def blog_remove(interaction, url:str):
+@app_commands.describe(url="삭제할 블로그 주소(정확히 일치)")
+async def blog_remove(interaction: discord.Interaction, url: str):
+    await interaction.response.defer(ephemeral=True)
     owner_id = await get_owner(interaction.channel.id)
     if not owner_id or owner_id != interaction.user.id:
-        return await interaction.response.send_message("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
+        return await interaction.followup.send("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
 
     await remove_blog(interaction.channel.id, url)
-    await ensure_dashboard_at_bottom(interaction.channel)
+    await refresh_dashboard_safe(interaction.channel)
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message("블로그가 삭제되었습니다.", ephemeral=True)
+    await interaction.followup.send("블로그가 삭제되었습니다.", ephemeral=True)
 
 @BOT.tree.command(name="블로그삭제전체", description="현재 개인 채널의 모든 블로그를 삭제합니다.")
 @app_commands.guild_only()
-async def blog_clear(interaction):
+async def blog_clear(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     owner_id = await get_owner(interaction.channel.id)
     if not owner_id or owner_id != interaction.user.id:
-        return await interaction.response.send_message("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
+        return await interaction.followup.send("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
 
     await clear_blogs(interaction.channel.id)
-    await ensure_dashboard_at_bottom(interaction.channel)
+    # 대시보드도 정리(메시지 삭제 + message_id NULL)
+    await refresh_dashboard_safe(interaction.channel)
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message("모든 블로그가 삭제되었습니다.", ephemeral=True)
+    await interaction.followup.send("모든 블로그가 삭제되었습니다.", ephemeral=True)
 
 @BOT.tree.command(name="블로그목록", description="서버 전체 블로그 목록을 특정 채널에 게시합니다. (관리자 전용)")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(manage_guild=True)
-async def blog_list(interaction, channel:discord.TextChannel):
-    SERVER_DASHBOARDS[interaction.guild.id] = (channel.id, None)
+@app_commands.describe(channel="게시할 텍스트 채널")
+async def blog_list(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
+    SERVER_DASHBOARDS[interaction.guild.id] = (channel.id, SERVER_DASHBOARDS.get(interaction.guild.id, (None, None))[1])
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message(f"{channel.mention} 에 서버 전체 블로그 목록을 게시했습니다.", ephemeral=True)
+    await interaction.followup.send(f"{channel.mention} 에 서버 전체 블로그 목록을 게시했습니다.", ephemeral=True)
 
 # ========= 실행 =========
 async def main():
