@@ -1,5 +1,5 @@
 # bot.py
-import os
+import os, certifi
 import re
 import ssl
 import asyncio
@@ -15,7 +15,7 @@ from aiohttp import web  # 헬스 서버용
 
 # ========= 설정 =========
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@host:5432/db?sslmode=require
+DATABASE_URL = os.getenv("DATABASE_URL")  # (권장) Supabase Transaction Pooler URI :6543 + ?sslmode=require
 TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))  # 테스트 서버 ID(선택). 있으면 길드 싱크로 즉시 반영
 PORT = int(os.getenv("PORT", "10000"))               # Render가 주는 포트
 COMMAND_PREFIX = "!"
@@ -24,7 +24,21 @@ INTENTS.message_content = True
 INTENTS.members = True
 BOT = commands.Bot(command_prefix=COMMAND_PREFIX, intents=INTENTS)
 
-SSL_CTX = ssl.create_default_context()
+# NEW: certifi로 CA 체인 명시(엄격 모드). 필요시 DB_SSL_INSECURE=1로 완화 가능
+def make_ssl_ctx() -> ssl.SSLContext:
+    insecure = os.getenv("DB_SSL_INSECURE") == "1"
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+SSL_CTX = make_ssl_ctx()
+
 PG_POOL: Optional[asyncpg.Pool] = None  # 전역 풀
 
 # ========= DB 유틸 =========
@@ -185,7 +199,12 @@ async def connect_db_with_retry(max_attempts=8):
     for attempt in range(1, max_attempts + 1):
         try:
             PG_POOL = await asyncpg.create_pool(
-                DATABASE_URL, min_size=1, max_size=5, ssl=SSL_CTX, command_timeout=60
+                DATABASE_URL,
+                min_size=1,
+                max_size=5,
+                ssl=SSL_CTX,
+                command_timeout=60,
+                statement_cache_size=0,   # NEW: Supabase Pooler(pgbouncer) 호환
             )
             await init_db()
             print("DB pool ready")
@@ -220,6 +239,10 @@ async def on_ready():
 @BOT.event
 async def on_message(message:discord.Message):
     if message.author.bot or not message.guild:
+        return
+
+    # NEW: DB 연결 전이면 DB 의존 로직은 건너뛰어 타임아웃/예외 방지
+    if PG_POOL is None:
         return
 
     nick_ch, create_ch = await get_settings(message.guild.id)
@@ -286,6 +309,9 @@ admin = GuildAdmin(
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def set_nick_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    # NEW: DB 없음 안내(타임아웃 방지)
+    if PG_POOL is None:
+        return await interaction.response.send_message("지금 DB에 연결할 수 없어 설정을 저장하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     await set_setting(interaction.guild.id, "nick_channel_id", channel.id)
     await interaction.response.send_message(f"닉변 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
@@ -295,6 +321,8 @@ async def set_nick_channel(interaction:discord.Interaction, channel:discord.Text
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def set_create_channel(interaction:discord.Interaction, channel:discord.TextChannel):
+    if PG_POOL is None:
+        return await interaction.response.send_message("지금 DB에 연결할 수 없어 설정을 저장하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     await set_setting(interaction.guild.id, "create_channel_id", channel.id)
     await interaction.response.send_message(f"개인채널 생성 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
@@ -305,6 +333,8 @@ BOT.tree.add_command(admin)
 @app_commands.guild_only()
 @app_commands.describe(url="블로그 주소 (https://...)")
 async def blog_register(interaction:discord.Interaction, url:str):
+    if PG_POOL is None:
+        return await interaction.response.send_message("지금 DB에 연결할 수 없어 저장하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
 
@@ -324,6 +354,8 @@ async def blog_register(interaction:discord.Interaction, url:str):
 @BOT.tree.command(name="블로그삭제", description="현재 개인 채널의 블로그 등록을 해제합니다.")
 @app_commands.guild_only()
 async def blog_remove(interaction:discord.Interaction):
+    if PG_POOL is None:
+        return await interaction.response.send_message("지금 DB에 연결할 수 없어 처리하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
 
@@ -347,6 +379,8 @@ async def blog_remove(interaction:discord.Interaction):
 @BOT.tree.command(name="채널삭제", description="현재 개인 채널을 삭제합니다.")
 @app_commands.guild_only()
 async def delete_personal_channel(interaction: discord.Interaction):
+    if PG_POOL is None:
+        return await interaction.response.send_message("지금 DB에 연결할 수 없어 처리하지 못했어요. 잠시 후 다시 시도해 주세요 🙏", ephemeral=True)
     if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
 
