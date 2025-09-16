@@ -436,10 +436,11 @@ async def blog_register(interaction: discord.Interaction, url: str, title: Optio
     if not re.match(r"^https?://", url):
         return await interaction.response.send_message("URL은 http(s):// 로 시작해야 해요.", ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
     await add_blog(interaction.channel.id, url, title)
     await ensure_dashboard_at_bottom(interaction.channel)
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message("블로그가 등록되었습니다.", ephemeral=True)
+    await interaction.followup.send("블로그가 등록되었습니다 ✅", ephemeral=True)
 
 @BOT.tree.command(name="블로그삭제", description="현재 개인 채널에서 특정 블로그를 삭제합니다.")
 @app_commands.guild_only()
@@ -449,10 +450,11 @@ async def blog_remove(interaction: discord.Interaction, url: str):
     if not owner_id or owner_id != interaction.user.id:
         return await interaction.response.send_message("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
     await remove_blog(interaction.channel.id, url)
     await ensure_dashboard_at_bottom(interaction.channel)
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message("블로그가 삭제되었습니다.", ephemeral=True)
+    await interaction.followup.send("블로그가 삭제되었습니다 ✅", ephemeral=True)
 
 @BOT.tree.command(name="블로그삭제전체", description="현재 개인 채널의 모든 블로그를 삭제합니다.")
 @app_commands.guild_only()
@@ -461,10 +463,11 @@ async def blog_clear(interaction: discord.Interaction):
     if not owner_id or owner_id != interaction.user.id:
         return await interaction.response.send_message("본인 개인 채널에서만 삭제할 수 있어요.", ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
     await clear_blogs(interaction.channel.id)
     await ensure_dashboard_at_bottom(interaction.channel)
     await refresh_server_dashboard(interaction.guild)
-    await interaction.response.send_message("모든 블로그가 삭제되었습니다.", ephemeral=True)
+    await interaction.followup.send("모든 블로그가 삭제되었습니다 ✅", ephemeral=True)
 
 @BOT.tree.command(name="블로그목록", description="서버 전체 블로그 목록을 특정 채널에 게시합니다. (관리자 전용)")
 @app_commands.guild_only()
