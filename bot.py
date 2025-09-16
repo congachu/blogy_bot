@@ -1,6 +1,7 @@
 # bot.py
 import os
 import re
+import ssl
 import asyncio
 import contextlib
 from typing import Optional
@@ -9,19 +10,22 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import asyncpg  # ← PostgreSQL async driver
+import asyncpg
+from aiohttp import web  # 헬스 서버용
 
 # ========= 설정 =========
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # eg. postgres://user:pass@host:5432/dbname
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@host:5432/db?sslmode=require
+TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))  # 테스트 서버 ID(선택). 있으면 길드 싱크로 즉시 반영
+PORT = int(os.getenv("PORT", "10000"))               # Render가 주는 포트
 COMMAND_PREFIX = "!"
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
 BOT = commands.Bot(command_prefix=COMMAND_PREFIX, intents=INTENTS)
 
-# 전역 풀 (on_ready에서 초기화)
-PG_POOL: Optional[asyncpg.Pool] = None
+SSL_CTX = ssl.create_default_context()
+PG_POOL: Optional[asyncpg.Pool] = None  # 전역 풀
 
 # ========= DB 유틸 =========
 SCHEMA_SQL = """
@@ -159,23 +163,59 @@ async def ensure_dashboard_at_bottom(channel:discord.TextChannel):
     new_msg = await channel.send(embed=embed)
     await set_dashboard_message_id(channel.id, new_msg.id)
 
+# ========= 헬스 서버 & DB 재시도 =========
+async def run_health_server():
+    async def health(_):
+        return web.Response(text="ok")
+    app = web.Application()
+    app.router.add_get("/healthz", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    print(f"health server on :{PORT}/healthz")
+
+async def connect_db_with_retry(max_attempts=8):
+    """외부 DB 연결 안정화를 위해 백오프 재시도."""
+    global PG_POOL
+    if not DATABASE_URL:
+        print("DATABASE_URL is empty; DB features disabled")
+        return
+    delay = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            PG_POOL = await asyncpg.create_pool(
+                DATABASE_URL, min_size=1, max_size=5, ssl=SSL_CTX, command_timeout=60
+            )
+            await init_db()
+            print("DB pool ready")
+            return
+        except Exception as e:
+            print(f"DB connect attempt {attempt} failed: {e}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+    print("DB connect failed; continuing without DB")
+
 # ========= 봇 이벤트 =========
 @BOT.event
 async def on_ready():
-    global PG_POOL
-    if not DATABASE_URL:
-        raise RuntimeError("환경변수 DATABASE_URL이 필요합니다. (postgres://...)")
+    print(f"Logged in as {BOT.user} (ID: {BOT.user.id})")
 
-    # 커넥션 풀 만들기
-    PG_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    await init_db()
-
+    # 1) 슬래시 명령어를 먼저 동기화 (길드 지정 시 즉시 반영)
     try:
-        await BOT.tree.sync()
+        if TEST_GUILD_ID:
+            guild = discord.Object(id=TEST_GUILD_ID)
+            BOT.tree.copy_global_to(guild=guild)
+            synced = await BOT.tree.sync(guild=guild)
+            print(f"Slash synced to guild {TEST_GUILD_ID}: {len(synced)} cmds")
+        else:
+            synced = await BOT.tree.sync()
+            print(f"Slash synced globally: {len(synced)} cmds")
     except Exception as e:
         print("Sync error:", e)
 
-    print(f"Logged in as {BOT.user} (ID: {BOT.user.id})")
+    # 2) DB 연결(실패해도 봇은 계속 동작)
+    await connect_db_with_retry()
 
 @BOT.event
 async def on_message(message:discord.Message):
@@ -184,7 +224,7 @@ async def on_message(message:discord.Message):
 
     nick_ch, create_ch = await get_settings(message.guild.id)
 
-    # 2) 닉변 채널
+    # 닉변 채널
     if nick_ch and message.channel.id == nick_ch:
         new_nick = sanitize_nick(message.content)
         with contextlib.suppress(discord.Forbidden, discord.HTTPException):
@@ -195,7 +235,7 @@ async def on_message(message:discord.Message):
             await message.delete()
         return
 
-    # 3~5) 개인채널 생성 채널
+    # 개인채널 생성 채널
     if create_ch and message.channel.id == create_ch:
         existing = await get_channel_by_owner(message.author.id)
         if existing:
@@ -226,7 +266,7 @@ async def on_message(message:discord.Message):
             await message.add_reaction("✅")
         return
 
-    # 7) 개인채널이면 대시보드 최신 유지
+    # 개인채널이면 대시보드 최신 유지
     owner_id = await get_owner(message.channel.id)
     if owner_id:
         await ensure_dashboard_at_bottom(message.channel)
@@ -237,11 +277,11 @@ class GuildAdmin(app_commands.Group):
 
 admin = GuildAdmin(
     name="설정",
-    description="관리자 전용 설정",
-    guild_only=True
+    description="관리자 전용 설정"
 )
 
 @admin.command(name="닉변채널지정", description="닉네임 변경 채널을 지정합니다. (관리자 전용)")
+@app_commands.guild_only()
 @app_commands.describe(channel="닉변 채널로 사용할 텍스트 채널")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -250,6 +290,7 @@ async def set_nick_channel(interaction:discord.Interaction, channel:discord.Text
     await interaction.response.send_message(f"닉변 채널이 {channel.mention} 로 설정되었습니다.", ephemeral=True)
 
 @admin.command(name="개인채널생성채널지정", description="개인채널 생성 채널을 지정합니다. (관리자 전용)")
+@app_commands.guild_only()
 @app_commands.describe(channel="개인채널 생성용 텍스트 채널")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -306,31 +347,30 @@ async def blog_remove(interaction:discord.Interaction):
 @BOT.tree.command(name="채널삭제", description="현재 개인 채널을 삭제합니다.")
 @app_commands.guild_only()
 async def delete_personal_channel(interaction: discord.Interaction):
-    # 텍스트 채널만
     if not isinstance(interaction.channel, discord.TextChannel):
         return await interaction.response.send_message("텍스트 채널에서만 사용 가능합니다.", ephemeral=True)
 
-    # 개인채널 여부/소유자 확인
     owner_id = await get_owner(interaction.channel.id)
     if not owner_id:
         return await interaction.response.send_message("여기는 개인 채널이 아닙니다.", ephemeral=True)
     if owner_id != interaction.user.id:
         return await interaction.response.send_message("본인 개인 채널에서만 사용할 수 있어요.", ephemeral=True)
 
-    # 삭제 안내 후 삭제
     await interaction.response.send_message("이 채널을 삭제합니다. 3초 후 삭제돼요.", ephemeral=True)
     await asyncio.sleep(3)
-
-    # DB 정리 → 채널 삭제
     await purge_channel_records(interaction.channel.id)
     with contextlib.suppress(discord.Forbidden, discord.HTTPException):
         await interaction.channel.delete(reason=f"/채널삭제 by {interaction.user}")
 
-
 # ========= 실행 =========
-if __name__ == "__main__":
+async def main():
     if not TOKEN:
         raise SystemExit("환경변수 DISCORD_TOKEN을 설정하세요.")
-    if not DATABASE_URL:
-        raise SystemExit("환경변수 DATABASE_URL을 설정하세요. (postgres://...)")
-    BOT.run(TOKEN)
+    # 헬스 서버(포트 바인딩)와 봇을 동시에 실행
+    await asyncio.gather(
+        run_health_server(),
+        BOT.start(TOKEN),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
