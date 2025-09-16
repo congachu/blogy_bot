@@ -25,16 +25,10 @@ INTENTS.members = True
 BOT = commands.Bot(command_prefix=COMMAND_PREFIX, intents=INTENTS)
 
 # NEW: certifi로 CA 체인 명시(엄격 모드). 필요시 DB_SSL_INSECURE=1로 완화 가능
-def make_ssl_ctx() -> ssl.SSLContext:
-    insecure = os.getenv("DB_SSL_INSECURE") == "1"
-    if insecure:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-    ctx = ssl.create_default_context(cafile=certifi.where())
-    ctx.check_hostname = True
-    ctx.verify_mode = ssl.CERT_REQUIRED
+def make_ssl_ctx():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 SSL_CTX = make_ssl_ctx()
